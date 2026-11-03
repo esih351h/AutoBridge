@@ -13,6 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -70,8 +71,8 @@ jobs:
                   applicationId 'com.autobridge.app'
                   minSdk 26
                   targetSdk 35
-                  versionCode 3
-                  versionName '0.2.1'
+                  versionCode 4
+                  versionName '0.3.0'
               }
 
               compileOptions {
@@ -154,6 +155,55 @@ jobs:
               android:canRetrieveWindowContent="false"/>
           EOF
 
+          cat > app/src/main/java/com/autobridge/app/BridgeAccessibilityService.java <<'EOF'
+          package com.autobridge.app;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.provider.Settings;
+          import android.text.TextUtils;
+          import android.view.accessibility.AccessibilityEvent;
+
+          public class BridgeAccessibilityService extends AccessibilityService {
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+                  // Game automation is not enabled in this version.
+              }
+
+              @Override
+              public void onInterrupt() {
+                  // No automated gestures in this version.
+              }
+
+              public static boolean isEnabled(Context context) {
+                  String enabled = Settings.Secure.getString(
+                      context.getContentResolver(),
+                      Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+
+                  if (TextUtils.isEmpty(enabled)) return false;
+
+                  ComponentName expected = new ComponentName(
+                      context, BridgeAccessibilityService.class);
+
+                  TextUtils.SimpleStringSplitter splitter =
+                      new TextUtils.SimpleStringSplitter(':');
+
+                  splitter.setString(enabled);
+
+                  while (splitter.hasNext()) {
+                      ComponentName item =
+                          ComponentName.unflattenFromString(splitter.next());
+
+                      if (expected.equals(item)) return true;
+                  }
+
+                  return false;
+              }
+          }
+          EOF
+
           cat > app/src/main/java/com/autobridge/app/MainActivity.java <<'EOF'
           package com.autobridge.app;
 
@@ -162,7 +212,9 @@ jobs:
           import android.content.Context;
           import android.content.Intent;
           import android.content.IntentFilter;
+          import android.graphics.Bitmap;
           import android.graphics.BitmapFactory;
+          import android.graphics.Color;
           import android.media.projection.MediaProjectionManager;
           import android.os.Build;
           import android.os.Bundle;
@@ -175,13 +227,19 @@ jobs:
           import android.widget.TextView;
 
           import java.io.File;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.List;
 
           public class MainActivity extends Activity {
 
               private static final int REQUEST_CAPTURE = 1001;
+              private static final int SAMPLE_STEP = 2;
 
               private TextView serviceStatus;
               private TextView captureStatus;
+              private TextView detectionStatus;
               private ImageView preview;
               private BroadcastReceiver receiver;
               private boolean receiverRegistered = false;
@@ -192,54 +250,47 @@ jobs:
 
                   LinearLayout page = new LinearLayout(this);
                   page.setOrientation(LinearLayout.VERTICAL);
-                  page.setPadding(dp(20), dp(24), dp(20), dp(24));
+                  page.setPadding(dp(18), dp(20), dp(18), dp(24));
                   page.setBackgroundColor(0xFF101C2B);
 
-                  TextView title = text("AutoBridge", 28, 0xFFFFFFFF);
+                  TextView title = text("AutoBridge", 27, 0xFFFFFFFF);
                   title.setGravity(Gravity.CENTER);
                   page.addView(title);
 
                   TextView version = text(
-                      "Screenshot transfer fix - v0.2.1",
+                      "Blue-dot detection test - v0.3.0",
                       14, 0xFFB8C7D9);
                   version.setGravity(Gravity.CENTER);
                   page.addView(version);
 
-                  serviceStatus = text("", 16, 0xFFFFFFFF);
+                  serviceStatus = text("", 15, 0xFFFFFFFF);
                   page.addView(serviceStatus);
 
                   Button accessibility = new Button(this);
-                  accessibility.setText("Open Accessibility settings");
+                  accessibility.setText("Accessibility settings");
                   accessibility.setOnClickListener(v ->
                       startActivity(new Intent(
                           Settings.ACTION_ACCESSIBILITY_SETTINGS)));
                   page.addView(accessibility);
 
                   captureStatus = text(
-                      "Capture: not started", 16, 0xFFFFD180);
+                      "Capture: stopped", 15, 0xFFFFD180);
                   page.addView(captureStatus);
 
                   Button start = new Button(this);
-                  start.setText("Start Screen Capture");
+                  start.setText("Start Continuous Capture");
                   start.setOnClickListener(v -> requestCapture());
                   page.addView(start);
 
                   Button stop = new Button(this);
                   stop.setText("Stop Capture");
-                  stop.setOnClickListener(v -> {
-                      stopService(new Intent(
-                          this, ScreenCaptureService.class));
-                      setCaptureStatus("Capture: stopped");
-                  });
+                  stop.setOnClickListener(v -> stopCapture());
                   page.addView(stop);
 
-                  TextView instructions = text(
-                      "Approve Android screen capture permission. " +
-                      "Switch to your game within five seconds. " +
-                      "Return here to see the screenshot. " +
-                      "This build does not control the game.",
-                      14, 0xFFD6E0EA);
-                  page.addView(instructions);
+                  detectionStatus = text(
+                      "Blue markers: waiting for screenshot",
+                      14, 0xFF80CBC4);
+                  page.addView(detectionStatus);
 
                   preview = new ImageView(this);
                   preview.setAdjustViewBounds(true);
@@ -251,11 +302,18 @@ jobs:
                           LinearLayout.LayoutParams.MATCH_PARENT,
                           dp(300)));
 
+                  TextView explanation = text(
+                      "Blue candidates are approximate image detections. " +
+                      "They are not yet classified as Dot A or Dot B. " +
+                      "No automatic game input is performed.",
+                      13, 0xFFD6E0EA);
+                  page.addView(explanation);
+
                   ScrollView scroll = new ScrollView(this);
                   scroll.addView(page);
                   setContentView(scroll);
 
-                  registerFrameReceiver();
+                  registerReceiver();
                   updateServiceStatus();
               }
 
@@ -278,9 +336,11 @@ jobs:
                   if (requestCode != REQUEST_CAPTURE) return;
 
                   if (resultCode != RESULT_OK || data == null) {
-                      setCaptureStatus("Capture: permission denied");
+                      setStatus("Capture: permission denied");
                       return;
                   }
+
+                  stopService(new Intent(this, ScreenCaptureService.class));
 
                   Intent service = new Intent(
                       this, ScreenCaptureService.class);
@@ -295,16 +355,20 @@ jobs:
                           startService(service);
                       }
 
-                      setCaptureStatus(
-                          "Capture starting - switch to your game now");
+                      setStatus("Capture: starting");
 
                   } catch (Exception e) {
-                      setCaptureStatus(
-                          "Capture failed: " + e.getClass().getSimpleName());
+                      setStatus("Capture failed: " +
+                          e.getClass().getSimpleName());
                   }
               }
 
-              private void registerFrameReceiver() {
+              private void stopCapture() {
+                  stopService(new Intent(this, ScreenCaptureService.class));
+                  setStatus("Capture: stopped");
+              }
+
+              private void registerReceiver() {
                   receiver = new BroadcastReceiver() {
                       @Override
                       public void onReceive(
@@ -315,7 +379,8 @@ jobs:
                           if (ScreenCaptureService.ACTION_STATUS.equals(action)) {
                               String message =
                                   intent.getStringExtra("message");
-                              if (message != null) setCaptureStatus(message);
+
+                              if (message != null) setStatus(message);
                               return;
                           }
 
@@ -323,23 +388,22 @@ jobs:
                               String path =
                                   intent.getStringExtra("filePath");
 
-                              if (path == null) {
-                                  setCaptureStatus("Capture failed: no image path");
+                              if (path == null) return;
+
+                              File file = new File(path);
+
+                              if (!file.exists()) return;
+
+                              Bitmap bitmap =
+                                  BitmapFactory.decodeFile(path);
+
+                              if (bitmap == null) {
+                                  setStatus("Capture error: cannot decode image");
                                   return;
                               }
 
-                              File imageFile = new File(path);
-
-                              if (!imageFile.exists()) {
-                                  setCaptureStatus("Capture failed: image file missing");
-                                  return;
-                              }
-
-                              preview.setImageBitmap(
-                                  BitmapFactory.decodeFile(path));
-
-                              setCaptureStatus(
-                                  "Screenshot received successfully");
+                              preview.setImageBitmap(bitmap);
+                              updateDetection(bitmap);
                           }
                       }
                   };
@@ -358,7 +422,148 @@ jobs:
                   receiverRegistered = true;
               }
 
-              private void setCaptureStatus(String message) {
+              private void updateDetection(Bitmap bitmap) {
+                  List<Candidate> candidates = findBlueCandidates(bitmap);
+
+                  StringBuilder result = new StringBuilder();
+                  result.append("Blue candidates: ")
+                      .append(candidates.size());
+
+                  int shown = Math.min(10, candidates.size());
+
+                  for (int i = 0; i < shown; i++) {
+                      Candidate c = candidates.get(i);
+
+                      result.append("\\n")
+                          .append(i + 1)
+                          .append(". X=")
+                          .append(c.x)
+                          .append(" Y=")
+                          .append(c.y)
+                          .append(" Confidence=")
+                          .append(c.confidence)
+                          .append("%");
+                  }
+
+                  if (candidates.isEmpty()) {
+                      result.append("\\nNo blue candidates found.");
+                  }
+
+                  detectionStatus.setText(result.toString());
+              }
+
+              private List<Candidate> findBlueCandidates(Bitmap bitmap) {
+                  int width = bitmap.getWidth();
+                  int height = bitmap.getHeight();
+
+                  int gridW = (width + SAMPLE_STEP - 1) / SAMPLE_STEP;
+                  int gridH = (height + SAMPLE_STEP - 1) / SAMPLE_STEP;
+                  int total = gridW * gridH;
+
+                  boolean[] blue = new boolean[total];
+                  boolean[] visited = new boolean[total];
+
+                  for (int gy = 0; gy < gridH; gy++) {
+                      int y = Math.min(gy * SAMPLE_STEP, height - 1);
+
+                      for (int gx = 0; gx < gridW; gx++) {
+                          int x = Math.min(gx * SAMPLE_STEP, width - 1);
+                          int color = bitmap.getPixel(x, y);
+
+                          blue[gy * gridW + gx] = isBlue(color);
+                      }
+                  }
+
+                  int[] queue = new int[total];
+                  List<Candidate> found = new ArrayList<>();
+
+                  for (int start = 0; start < total; start++) {
+                      if (!blue[start] || visited[start]) continue;
+
+                      int head = 0;
+                      int tail = 0;
+
+                      queue[tail++] = start;
+                      visited[start] = true;
+
+                      int minX = gridW;
+                      int maxX = 0;
+                      int minY = gridH;
+                      int maxY = 0;
+                      int count = 0;
+
+                      while (head < tail) {
+                          int index = queue[head++];
+                          int x = index % gridW;
+                          int y = index / gridW;
+
+                          count++;
+
+                          minX = Math.min(minX, x);
+                          maxX = Math.max(maxX, x);
+                          minY = Math.min(minY, y);
+                          maxY = Math.max(maxY, y);
+
+                          for (int dy = -1; dy <= 1; dy++) {
+                              for (int dx = -1; dx <= 1; dx++) {
+                                  if (dx == 0 && dy == 0) continue;
+
+                                  int nx = x + dx;
+                                  int ny = y + dy;
+
+                                  if (nx < 0 || ny < 0 ||
+                                      nx >= gridW || ny >= gridH) continue;
+
+                                  int next = ny * gridW + nx;
+
+                                  if (blue[next] && !visited[next]) {
+                                      visited[next] = true;
+                                      queue[tail++] = next;
+                                  }
+                              }
+                          }
+                      }
+
+                      int boxW = maxX - minX + 1;
+                      int boxH = maxY - minY + 1;
+                      int boxArea = boxW * boxH;
+
+                      if (count < 3 || count > 350) continue;
+                      if (boxW > 35 || boxH > 35) continue;
+
+                      float ratio = (float) boxW / (float) boxH;
+
+                      if (ratio < 0.45f || ratio > 2.2f) continue;
+
+                      float fill = (float) count / boxArea;
+                      int confidence = Math.min(
+                          99, Math.round(fill * 100));
+
+                      int centerX = (minX + maxX) / 2 * SAMPLE_STEP;
+                      int centerY = (minY + maxY) / 2 * SAMPLE_STEP;
+
+                      found.add(new Candidate(
+                          centerX, centerY, confidence, count));
+                  }
+
+                  Collections.sort(found,
+                      (a, b) -> Integer.compare(b.area, a.area));
+
+                  return found;
+              }
+
+              private boolean isBlue(int color) {
+                  int r = Color.red(color);
+                  int g = Color.green(color);
+                  int b = Color.blue(color);
+
+                  return b >= 125 &&
+                      b > r * 1.30 &&
+                      b > g * 1.08 &&
+                      r < 150;
+              }
+
+              private void setStatus(String message) {
                   if (captureStatus != null) {
                       captureStatus.setText(message);
                   }
@@ -388,16 +593,18 @@ jobs:
                       unregisterReceiver(receiver);
                       receiverRegistered = false;
                   }
+
                   super.onDestroy();
               }
 
               private TextView text(
                   String value, int size, int color) {
+
                   TextView t = new TextView(this);
                   t.setText(value);
                   t.setTextSize(size);
                   t.setTextColor(color);
-                  t.setPadding(0, dp(10), 0, dp(10));
+                  t.setPadding(0, dp(9), 0, dp(9));
                   return t;
               }
 
@@ -405,55 +612,19 @@ jobs:
                   return Math.round(
                       value * getResources().getDisplayMetrics().density);
               }
-          }
-          EOF
-          
-          cat > app/src/main/java/com/autobridge/app/BridgeAccessibilityService.java <<'EOF'
-          package com.autobridge.app;
 
-          import android.accessibilityservice.AccessibilityService;
-          import android.content.ComponentName;
-          import android.content.Context;
-          import android.provider.Settings;
-          import android.text.TextUtils;
-          import android.view.accessibility.AccessibilityEvent;
+              private static class Candidate {
+                  final int x;
+                  final int y;
+                  final int confidence;
+                  final int area;
 
-          public class BridgeAccessibilityService extends AccessibilityService {
-
-              @Override
-              public void onAccessibilityEvent(AccessibilityEvent event) {
-                  // Game recognition will be added later.
-              }
-
-              @Override
-              public void onInterrupt() {
-                  // No automated gestures in this build.
-              }
-
-              public static boolean isEnabled(Context context) {
-                  String enabled = Settings.Secure.getString(
-                      context.getContentResolver(),
-                      Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-
-                  if (TextUtils.isEmpty(enabled)) return false;
-
-                  ComponentName expected = new ComponentName(
-                      context, BridgeAccessibilityService.class);
-
-                  TextUtils.SimpleStringSplitter splitter =
-                      new TextUtils.SimpleStringSplitter(':');
-
-                  splitter.setString(enabled);
-
-                  while (splitter.hasNext()) {
-                      ComponentName item =
-                          ComponentName.unflattenFromString(
-                              splitter.next());
-
-                      if (expected.equals(item)) return true;
+                  Candidate(int x, int y, int confidence, int area) {
+                      this.x = x;
+                      this.y = y;
+                      this.confidence = confidence;
+                      this.area = area;
                   }
-
-                  return false;
               }
           }
           EOF
@@ -469,7 +640,6 @@ jobs:
           import android.content.Intent;
           import android.content.pm.ServiceInfo;
           import android.graphics.Bitmap;
-          import android.graphics.BitmapFactory;
           import android.graphics.PixelFormat;
           import android.hardware.display.DisplayManager;
           import android.hardware.display.VirtualDisplay;
@@ -478,7 +648,6 @@ jobs:
           import android.media.projection.MediaProjection;
           import android.media.projection.MediaProjectionManager;
           import android.os.Build;
-          import android.os.Environment;
           import android.os.Handler;
           import android.os.HandlerThread;
           import android.os.IBinder;
@@ -504,7 +673,9 @@ jobs:
               private ImageReader imageReader;
               private HandlerThread workerThread;
               private Handler worker;
-              private boolean frameSent = false;
+
+              private long lastFrameTime = 0;
+              private boolean stopping = false;
 
               @Override
               public void onCreate() {
@@ -520,25 +691,22 @@ jobs:
               @Override
               public int onStartCommand(Intent intent, int flags, int startId) {
                   if (intent == null) {
-                      sendStatus("Capture failed: missing request");
                       stopSelf();
                       return START_NOT_STICKY;
                   }
 
                   int resultCode = intent.getIntExtra("resultCode", 0);
-
                   Intent data = intent.getParcelableExtra("captureData");
-
-                  Notification notification = buildNotification();
 
                   try {
                       if (Build.VERSION.SDK_INT >= 29) {
                           startForeground(
                               NOTIFICATION_ID,
-                              notification,
+                              buildNotification(),
                               ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
                       } else {
-                          startForeground(NOTIFICATION_ID, notification);
+                          startForeground(
+                              NOTIFICATION_ID, buildNotification());
                       }
 
                       MediaProjectionManager manager =
@@ -562,9 +730,9 @@ jobs:
                               }
                           }, worker);
 
-                      sendStatus("Permission accepted - preparing capture");
+                      sendStatus("Permission accepted - starting continuous capture");
 
-                      worker.postDelayed(this::beginCapture, 5000);
+                      beginCapture();
 
                   } catch (Exception e) {
                       sendStatus("Capture failed: " +
@@ -576,12 +744,6 @@ jobs:
               }
 
               private void beginCapture() {
-                  if (projection == null) {
-                      sendStatus("Capture failed: projection ended");
-                      stopSelf();
-                      return;
-                  }
-
                   try {
                       WindowManager wm =
                           (WindowManager) getSystemService(WINDOW_SERVICE);
@@ -594,7 +756,7 @@ jobs:
                       int density = metrics.densityDpi;
 
                       imageReader = ImageReader.newInstance(
-                          width, height, PixelFormat.RGBA_8888, 2);
+                          width, height, PixelFormat.RGBA_8888, 3);
 
                       imageReader.setOnImageAvailableListener(
                           this::receiveFrame, worker);
@@ -609,23 +771,34 @@ jobs:
                           null,
                           worker);
 
-                      sendStatus("Capturing screen...");
+                      sendStatus("Continuous capture active");
 
                   } catch (Exception e) {
-                      sendStatus("Capture failed: " +
+                      sendStatus("Capture setup failed: " +
                           e.getClass().getSimpleName());
                       stopSelf();
                   }
               }
 
               private void receiveFrame(ImageReader reader) {
-                  if (frameSent) return;
+                  if (stopping) return;
+
+                  long now = System.currentTimeMillis();
+
+                  // Limit processing to approximately two frames per second.
+                  if (now - lastFrameTime < 500) {
+                      Image discarded = reader.acquireLatestImage();
+                      if (discarded != null) discarded.close();
+                      return;
+                  }
 
                   Image image = null;
 
                   try {
                       image = reader.acquireLatestImage();
                       if (image == null) return;
+
+                      lastFrameTime = now;
 
                       Image.Plane plane = image.getPlanes()[0];
 
@@ -660,9 +833,7 @@ jobs:
 
                       try {
                           boolean saved = bitmap.compress(
-                              Bitmap.CompressFormat.JPEG,
-                              88,
-                              stream);
+                              Bitmap.CompressFormat.JPEG, 85, stream);
 
                           stream.flush();
 
@@ -675,8 +846,6 @@ jobs:
                           bitmap.recycle();
                       }
 
-                      frameSent = true;
-
                       Intent broadcast = new Intent(ACTION_FRAME);
                       broadcast.setPackage(getPackageName());
                       broadcast.putExtra(
@@ -684,14 +853,9 @@ jobs:
 
                       sendBroadcast(broadcast);
 
-                      sendStatus("Screenshot saved - returning to AutoBridge");
-
-                      stopSelf();
-
                   } catch (Exception e) {
-                      sendStatus("Screenshot failed: " +
+                      sendStatus("Frame error: " +
                           e.getClass().getSimpleName());
-                      stopSelf();
 
                   } finally {
                       if (image != null) image.close();
@@ -716,7 +880,7 @@ jobs:
 
                   return builder
                       .setContentTitle("AutoBridge screen capture")
-                      .setContentText("Capturing one game screenshot")
+                      .setContentText("Continuous game-screen analysis")
                       .setSmallIcon(android.R.drawable.ic_menu_camera)
                       .setOngoing(true)
                       .build();
@@ -739,6 +903,8 @@ jobs:
 
               @Override
               public void onDestroy() {
+                  stopping = true;
+
                   if (virtualDisplay != null) {
                       virtualDisplay.release();
                       virtualDisplay = null;
@@ -776,7 +942,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AutoBridge-v0.2.1-debug-apk
+          name: AutoBridge-v0.3.0-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          
