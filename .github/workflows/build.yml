@@ -74,8 +74,8 @@ jobs:
                   applicationId 'com.autobridge.app'
                   minSdk 26
                   targetSdk 35
-                  versionCode 1
-                  versionName '0.1.0'
+                  versionCode 2
+                  versionName '0.2.0'
               }
 
               compileOptions {
@@ -88,6 +88,10 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+
               <application
                   android:allowBackup="true"
                   android:label="AutoBridge"
@@ -115,6 +119,11 @@ jobs:
                           android:name="android.accessibilityservice"
                           android:resource="@xml/accessibility_service_config"/>
                   </service>
+
+                  <service
+                      android:name=".ScreenCaptureService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection"/>
               </application>
           </manifest>
           EOF
@@ -153,18 +162,31 @@ jobs:
           package com.autobridge.app;
 
           import android.app.Activity;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
           import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.graphics.Bitmap;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
           import android.os.Bundle;
           import android.provider.Settings;
           import android.view.Gravity;
           import android.widget.Button;
+          import android.widget.ImageView;
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
           import android.widget.TextView;
 
           public class MainActivity extends Activity {
+
+              private static final int REQUEST_CAPTURE = 1001;
+
               private TextView serviceStatus;
-              private TextView stageStatus;
+              private TextView captureStatus;
+              private ImageView preview;
+              private BroadcastReceiver receiver;
+              private boolean receiverRegistered = false;
 
               @Override
               public void onCreate(Bundle state) {
@@ -172,62 +194,144 @@ jobs:
 
                   LinearLayout page = new LinearLayout(this);
                   page.setOrientation(LinearLayout.VERTICAL);
-                  page.setPadding(dp(22), dp(28), dp(22), dp(22));
+                  page.setPadding(dp(20), dp(24), dp(20), dp(24));
                   page.setBackgroundColor(0xFF101C2B);
 
                   TextView title = text("AutoBridge", 28, 0xFFFFFFFF);
                   title.setGravity(Gravity.CENTER);
                   page.addView(title);
 
-                  TextView subtitle = text(
-                      "Early testing build - v0.1.0", 14, 0xFFB8C7D9);
-                  subtitle.setGravity(Gravity.CENTER);
-                  page.addView(subtitle);
+                  TextView version = text(
+                      "Screen capture test - v0.2.0",
+                      14, 0xFFB8C7D9);
+                  version.setGravity(Gravity.CENTER);
+                  page.addView(version);
 
                   serviceStatus = text("", 16, 0xFFFFFFFF);
                   page.addView(serviceStatus);
 
-                  stageStatus = text("", 15, 0xFFFFD180);
-                  page.addView(stageStatus);
-
-                  Button settings = new Button(this);
-                  settings.setText("Open Accessibility settings");
-                  settings.setOnClickListener(v ->
+                  Button accessibility = new Button(this);
+                  accessibility.setText("Open Accessibility settings");
+                  accessibility.setOnClickListener(v ->
                       startActivity(new Intent(
                           Settings.ACTION_ACCESSIBILITY_SETTINGS)));
-                  page.addView(settings);
+                  page.addView(accessibility);
 
-                  Button refresh = new Button(this);
-                  refresh.setText("Refresh service status");
-                  refresh.setOnClickListener(v -> updateStatus());
-                  page.addView(refresh);
+                  captureStatus = text(
+                      "Capture: not started", 16, 0xFFFFD180);
+                  page.addView(captureStatus);
 
-                  TextView info = text(
-                      "This first build verifies that AutoBridge installs and " +
-                      "can detect its Accessibility-service permission. " +
-                      "Automatic game recognition, blue-dot detection, pole " +
-                      "measurement, touch automation, result recognition " +
-                      "and learning are not implemented yet. They will be " +
-                      "added and tested in later milestones.",
-                      15, 0xFFD6E0EA);
+                  Button start = new Button(this);
+                  start.setText("Start Screen Capture");
+                  start.setOnClickListener(v -> requestCapture());
+                  page.addView(start);
 
-                  info.setPadding(0, dp(22), 0, 0);
-                  page.addView(info);
+                  Button stop = new Button(this);
+                  stop.setText("Stop Capture");
+                  stop.setOnClickListener(v -> {
+                      stopService(new Intent(
+                          this, ScreenCaptureService.class));
+                      captureStatus.setText("Capture: stopped");
+                  });
+                  page.addView(stop);
+
+                  TextView instructions = text(
+                      "After approving Android's capture permission, " +
+                      "switch to your game within five seconds. AutoBridge " +
+                      "will capture one screenshot. Return here to see it. " +
+                      "This build does not control the game.",
+                      14, 0xFFD6E0EA);
+                  instructions.setPadding(0, dp(12), 0, dp(12));
+                  page.addView(instructions);
+
+                  preview = new ImageView(this);
+                  preview.setAdjustViewBounds(true);
+                  preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  preview.setBackgroundColor(0xFF26384A);
+                  page.addView(preview,
+                      new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          dp(300)));
 
                   ScrollView scroll = new ScrollView(this);
                   scroll.addView(page);
                   setContentView(scroll);
 
-                  updateStatus();
+                  registerFrameReceiver();
+                  updateServiceStatus();
+              }
+
+              private void requestCapture() {
+                  MediaProjectionManager manager =
+                      (MediaProjectionManager) getSystemService(
+                          Context.MEDIA_PROJECTION_SERVICE);
+
+                  startActivityForResult(
+                      manager.createScreenCaptureIntent(),
+                      REQUEST_CAPTURE);
               }
 
               @Override
-              protected void onResume() {
-                  super.onResume();
-                  updateStatus();
+              protected void onActivityResult(
+                  int requestCode, int resultCode, Intent data) {
+
+                  super.onActivityResult(requestCode, resultCode, data);
+
+                  if (requestCode != REQUEST_CAPTURE) return;
+
+                  if (resultCode != RESULT_OK || data == null) {
+                      captureStatus.setText(
+                          "Capture: permission denied");
+                      return;
+                  }
+
+                  Intent service = new Intent(
+                      this, ScreenCaptureService.class);
+
+                  service.putExtra("resultCode", resultCode);
+                  service.putExtra("captureData", data);
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      startForegroundService(service);
+                  } else {
+                      startService(service);
+                  }
+
+                  captureStatus.setText(
+                      "Capture starting - switch to your game now");
               }
 
-              private void updateStatus() {
+              private void registerFrameReceiver() {
+                  receiver = new BroadcastReceiver() {
+                      @Override
+                      public void onReceive(
+                          Context context, Intent intent) {
+
+                          Bitmap bitmap = intent.getParcelableExtra(
+                              ScreenCaptureService.EXTRA_BITMAP);
+
+                          if (bitmap != null) {
+                              preview.setImageBitmap(bitmap);
+                              captureStatus.setText(
+                                  "Capture: screenshot received");
+                          }
+                      }
+                  };
+
+                  IntentFilter filter = new IntentFilter(
+                      ScreenCaptureService.ACTION_FRAME);
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      registerReceiver(
+                          receiver, filter, Context.RECEIVER_NOT_EXPORTED);
+                  } else {
+                      registerReceiver(receiver, filter);
+                  }
+
+                  receiverRegistered = true;
+              }
+
+              private void updateServiceStatus() {
                   boolean enabled =
                       BridgeAccessibilityService.isEnabled(this);
 
@@ -237,13 +341,26 @@ jobs:
 
                   serviceStatus.setTextColor(
                       enabled ? 0xFF81C784 : 0xFFFFCC80);
-
-                  stageStatus.setText(enabled
-                      ? "Foundation ready - automation not implemented"
-                      : "Enable Accessibility service to prepare for testing");
               }
 
-              private TextView text(String value, int size, int color) {
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (serviceStatus != null) updateServiceStatus();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (receiverRegistered) {
+                      unregisterReceiver(receiver);
+                      receiverRegistered = false;
+                  }
+                  super.onDestroy();
+              }
+
+              private TextView text(
+                  String value, int size, int color) {
+
                   TextView t = new TextView(this);
                   t.setText(value);
                   t.setTextSize(size);
@@ -278,7 +395,7 @@ jobs:
 
               @Override
               public void onInterrupt() {
-                  // This foundation build does not initiate gestures.
+                  // No automated gestures in this build.
               }
 
               public static boolean isEnabled(Context context) {
@@ -286,9 +403,7 @@ jobs:
                       context.getContentResolver(),
                       Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
 
-                  if (TextUtils.isEmpty(enabled)) {
-                      return false;
-                  }
+                  if (TextUtils.isEmpty(enabled)) return false;
 
                   ComponentName expected = new ComponentName(
                       context, BridgeAccessibilityService.class);
@@ -303,12 +418,264 @@ jobs:
                           ComponentName.unflattenFromString(
                               splitter.next());
 
-                      if (expected.equals(item)) {
-                          return true;
-                      }
+                      if (expected.equals(item)) return true;
                   }
 
                   return false;
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/autobridge/app/ScreenCaptureService.java <<'EOF'
+          package com.autobridge.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.PixelFormat;
+          import android.hardware.display.DisplayManager;
+          import android.hardware.display.VirtualDisplay;
+          import android.media.Image;
+          import android.media.ImageReader;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.HandlerThread;
+          import android.os.IBinder;
+          import android.util.DisplayMetrics;
+          import android.view.WindowManager;
+
+          public class ScreenCaptureService extends Service {
+
+              public static final String ACTION_FRAME =
+                  "com.autobridge.app.SCREEN_FRAME";
+
+              public static final String EXTRA_BITMAP = "bitmap";
+
+              private static final String CHANNEL_ID = "autobridge_capture";
+              private static final int NOTIFICATION_ID = 202;
+
+              private MediaProjection projection;
+              private VirtualDisplay virtualDisplay;
+              private ImageReader imageReader;
+              private HandlerThread workerThread;
+              private Handler worker;
+              private boolean frameSent = false;
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  workerThread = new HandlerThread("AutoBridgeCapture");
+                  workerThread.start();
+                  worker = new Handler(workerThread.getLooper());
+                  createNotificationChannel();
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent == null) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+
+                  int resultCode = intent.getIntExtra("resultCode", 0);
+                  Intent data = intent.getParcelableExtra("captureData");
+
+                  Notification notification = buildNotification();
+
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(
+                          NOTIFICATION_ID,
+                          notification,
+                          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                  } else {
+                      startForeground(NOTIFICATION_ID, notification);
+                  }
+
+                  try {
+                      MediaProjectionManager manager =
+                          (MediaProjectionManager) getSystemService(
+                              Context.MEDIA_PROJECTION_SERVICE);
+
+                      projection = manager.getMediaProjection(resultCode, data);
+
+                      if (projection == null) {
+                          stopSelf();
+                          return START_NOT_STICKY;
+                      }
+
+                      projection.registerCallback(
+                          new MediaProjection.Callback() {
+                              @Override
+                              public void onStop() {
+                                  stopSelf();
+                              }
+                          }, worker);
+
+                      worker.postDelayed(this::beginCapture, 5000);
+
+                  } catch (Exception e) {
+                      stopSelf();
+                  }
+
+                  return START_NOT_STICKY;
+              }
+
+              private void beginCapture() {
+                  if (projection == null) {
+                      stopSelf();
+                      return;
+                  }
+
+                  try {
+                      WindowManager wm =
+                          (WindowManager) getSystemService(WINDOW_SERVICE);
+
+                      DisplayMetrics metrics = new DisplayMetrics();
+                      wm.getDefaultDisplay().getRealMetrics(metrics);
+
+                      int width = metrics.widthPixels;
+                      int height = metrics.heightPixels;
+                      int density = metrics.densityDpi;
+
+                      imageReader = ImageReader.newInstance(
+                          width, height, PixelFormat.RGBA_8888, 2);
+
+                      imageReader.setOnImageAvailableListener(
+                          reader -> receiveFrame(reader),
+                          worker);
+
+                      virtualDisplay = projection.createVirtualDisplay(
+                          "AutoBridgeScreen",
+                          width,
+                          height,
+                          density,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                          imageReader.getSurface(),
+                          null,
+                          worker);
+
+                  } catch (Exception e) {
+                      stopSelf();
+                  }
+              }
+
+              private void receiveFrame(ImageReader reader) {
+                  if (frameSent) return;
+
+                  Image image = null;
+
+                  try {
+                      image = reader.acquireLatestImage();
+                      if (image == null) return;
+
+                      Image.Plane plane = image.getPlanes()[0];
+                      int pixelStride = plane.getPixelStride();
+                      int rowStride = plane.getRowStride();
+                      int width = image.getWidth();
+                      int height = image.getHeight();
+
+                      int rowPadding =
+                          rowStride - pixelStride * width;
+
+                      int paddedWidth =
+                          width + rowPadding / pixelStride;
+
+                      Bitmap padded = Bitmap.createBitmap(
+                          paddedWidth,
+                          height,
+                          Bitmap.Config.ARGB_8888);
+
+                      padded.copyPixelsFromBuffer(
+                          plane.getBuffer());
+
+                      Bitmap bitmap = Bitmap.createBitmap(
+                          padded, 0, 0, width, height);
+
+                      if (bitmap != padded) padded.recycle();
+
+                      Intent broadcast = new Intent(ACTION_FRAME);
+                      broadcast.setPackage(getPackageName());
+                      broadcast.putExtra(EXTRA_BITMAP, bitmap);
+                      sendBroadcast(broadcast);
+
+                      frameSent = true;
+                      stopSelf();
+
+                  } catch (Exception e) {
+                      stopSelf();
+                  } finally {
+                      if (image != null) image.close();
+                  }
+              }
+
+              private Notification buildNotification() {
+                  Notification.Builder builder;
+
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      builder = new Notification.Builder(this, CHANNEL_ID);
+                  } else {
+                      builder = new Notification.Builder(this);
+                  }
+
+                  return builder
+                      .setContentTitle("AutoBridge screen capture")
+                      .setContentText("Capturing one game screenshot")
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setOngoing(true)
+                      .build();
+              }
+
+              private void createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel channel =
+                          new NotificationChannel(
+                              CHANNEL_ID,
+                              "AutoBridge capture",
+                              NotificationManager.IMPORTANCE_LOW);
+
+                      NotificationManager manager =
+                          getSystemService(NotificationManager.class);
+
+                      manager.createNotificationChannel(channel);
+                  }
+              }
+
+              @Override
+              public void onDestroy() {
+                  if (virtualDisplay != null) {
+                      virtualDisplay.release();
+                      virtualDisplay = null;
+                  }
+
+                  if (imageReader != null) {
+                      imageReader.close();
+                      imageReader = null;
+                  }
+
+                  if (projection != null) {
+                      projection.stop();
+                      projection = null;
+                  }
+
+                  if (workerThread != null) {
+                      workerThread.quitSafely();
+                      workerThread = null;
+                  }
+
+                  stopForeground(true);
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
               }
           }
           EOF
@@ -319,7 +686,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AutoBridge-debug-apk
+          name: AutoBridge-v0.2.0-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          
